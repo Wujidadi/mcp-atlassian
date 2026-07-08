@@ -1,5 +1,6 @@
 """Module for Jira issue operations."""
 
+import json
 import logging
 from collections import defaultdict
 from typing import Any
@@ -337,9 +338,9 @@ class IssuesMixin(
 
                 comments = response["comments"]
 
-                # Limit comments if needed
+                # Jira returns comments oldest-first; keep the newest comments.
                 if comment_limit is not None:
-                    comments = comments[:comment_limit]
+                    comments = comments[-comment_limit:]
 
                 return comments
             except Exception as e:
@@ -613,7 +614,7 @@ class IssuesMixin(
                 if epic_type_id:
                     actual_issue_id = epic_type_id
                     logger.info(f"Using localized Epic issue type id: {epic_type_id}")
-            elif issue_type.lower() in ["subtask", "sub-task"]:
+            elif self._normalize_issue_type_name(issue_type) == "subtask":
                 # If the user provided "Subtask" but we need to find the localized name
                 subtask_type_id = self._find_subtask_issue_type_id(project_key)
                 if subtask_type_id:
@@ -788,20 +789,43 @@ class IssuesMixin(
             logger.warning(f"Could not get issue types for project {project_key}: {e}")
             return None
 
+    def _normalize_issue_type_name(self, issue_type: str) -> str:
+        """
+        Normalize an issue type name for comparison.
+
+        Args:
+            issue_type: The issue type name to normalize
+
+        Returns:
+            Normalized issue type name
+        """
+        return issue_type.lower().replace("-", "").replace(" ", "")
+
     def _find_subtask_issue_type_id(self, project_key: str) -> str | None:
         """
-        Find the actual Subtask issue type name for a project.
+        Find the best matching subtask issue type id for a project.
 
         Args:
             project_key: The project key
 
         Returns:
-            The Subtask issue type name if found, None otherwise
+            The best matching subtask issue type id if found, None otherwise
         """
         try:
             issue_types = self.get_project_issue_types(project_key)
+
+            # Prefer a server-returned subtask issue type name that
+            # normalizes to "subtask" before falling back.
             for issue_type in issue_types:
-                # Check the subtask field - this is the most reliable way
+                type_name = issue_type.get("name", "")
+                if (
+                    issue_type.get("subtask", False)
+                    and self._normalize_issue_type_name(type_name) == "subtask"
+                ):
+                    return issue_type.get("id")
+
+            # Final fallback: first available subtask-capable issue type.
+            for issue_type in issue_types:
                 if issue_type.get("subtask", False):
                     return issue_type.get("id")
             return None
@@ -1171,8 +1195,24 @@ class IssuesMixin(
 
             # Get the updated issue data and convert to JiraIssue model
             issue_data = self.jira.get_issue(issue_key)
+            if isinstance(issue_data, str):
+                # atlassian-python-api can return a string on Jira Server/DC
+                # when response.json() fails. Try parsing it as JSON first.
+                try:
+                    issue_data = json.loads(issue_data)
+                except (ValueError, TypeError):
+                    logger.warning(
+                        f"get_issue returned a string for {issue_key}, "
+                        f"re-fetching via direct GET"
+                    )
+                    issue_data = self.jira.get(
+                        self.jira.resource_url("issue/" + issue_key)
+                    )
             if not isinstance(issue_data, dict):
-                msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+                msg = (
+                    f"Unexpected return value type from `jira.get_issue`: "
+                    f"{type(issue_data)}"
+                )
                 logger.error(msg)
                 raise TypeError(msg)
             issue = JiraIssue.from_api_response(issue_data)

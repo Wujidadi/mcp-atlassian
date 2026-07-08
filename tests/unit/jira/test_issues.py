@@ -1,5 +1,6 @@
 """Tests for the Jira Issues mixin."""
 
+from typing import Any
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
@@ -99,6 +100,50 @@ class TestIssuesMixin:
         assert hasattr(issue, "comments")
         assert len(issue.comments) == 1
         assert issue.comments[0].body == "This is a comment"
+
+    def test_get_issue_with_comment_limit_returns_newest_comments(
+        self, issues_mixin: IssuesMixin, make_issue_data: Any
+    ) -> None:
+        """Test that comment_limit keeps the newest comments from Jira."""
+        comments_data = {
+            "comments": [
+                {
+                    "id": "1",
+                    "body": "Oldest comment",
+                    "author": {"displayName": "John Doe"},
+                    "created": "2023-01-01T00:00:00.000+0000",
+                    "updated": "2023-01-01T00:00:00.000+0000",
+                },
+                {
+                    "id": "2",
+                    "body": "Middle comment",
+                    "author": {"displayName": "Jane Doe"},
+                    "created": "2023-01-02T00:00:00.000+0000",
+                    "updated": "2023-01-02T00:00:00.000+0000",
+                },
+                {
+                    "id": "3",
+                    "body": "Newest comment",
+                    "author": {"displayName": "Bob Doe"},
+                    "created": "2023-01-03T00:00:00.000+0000",
+                    "updated": "2023-01-03T00:00:00.000+0000",
+                },
+            ]
+        }
+
+        issue_data = make_issue_data(comment={"comments": []})
+
+        issues_mixin.jira.get_issue.return_value = issue_data
+        issues_mixin.jira.issue_get_comments.return_value = comments_data
+
+        issue = issues_mixin.get_issue("TEST-123", comment_limit=2)
+
+        issues_mixin.jira.issue_get_comments.assert_called_once_with("TEST-123")
+        assert [comment.id for comment in issue.comments] == ["2", "3"]
+        assert [comment.body for comment in issue.comments] == [
+            "Middle comment",
+            "Newest comment",
+        ]
 
     def test_get_issue_includes_comment_field_when_comment_limit_positive(
         self, issues_mixin: IssuesMixin
@@ -600,6 +645,42 @@ class TestIssuesMixin:
                 # after the initial creation
                 assert issues_mixin.get_issue.called
                 assert result.key == "EPIC-123"
+
+    def test_update_issue_handles_string_response_as_json(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Test update_issue handles Server/DC JSON string get_issue responses."""
+        import json
+
+        issue_dict = make_issue_data(summary="Updated Summary", status="In Progress")
+        # Simulate atlassian-python-api returning a JSON string instead of dict
+        issues_mixin.jira.get_issue.return_value = json.dumps(issue_dict)
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        document = issues_mixin.update_issue(
+            issue_key="TEST-123", fields={"summary": "Updated Summary"}
+        )
+
+        assert document.key == "TEST-123"
+        assert document.summary == "Updated Summary"
+
+    def test_update_issue_handles_string_response_with_refetch(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """Test update_issue re-fetches when a string response is not JSON."""
+        issue_dict = make_issue_data(summary="Refetched", status="Open")
+        # First call returns non-JSON string, direct GET returns dict
+        issues_mixin.jira.get_issue.return_value = "<html>WAF login page</html>"
+        issues_mixin.jira.get.return_value = issue_dict
+        issues_mixin.jira.resource_url.return_value = "/rest/api/2/issue/TEST-123"
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        document = issues_mixin.update_issue(
+            issue_key="TEST-123", fields={"summary": "Refetched"}
+        )
+
+        issues_mixin.jira.get.assert_called_once_with("/rest/api/2/issue/TEST-123")
+        assert document.key == "TEST-123"
 
     def test_update_issue_basic(self, issues_mixin: IssuesMixin, make_issue_data):
         """Test updating an issue with basic fields."""
