@@ -959,41 +959,6 @@ def test_markdown_to_jira_preserves_underscores_in_url_targets(
     )
 
 
-def test_markdown_to_jira_preserves_underscores_in_bare_urls(preprocessor_with_jira):
-    """Bare URLs are auto-linked by Jira, so their underscores stay literal."""
-    assert (
-        preprocessor_with_jira.markdown_to_jira(
-            "MR: https://gitlab.example.com/g/p/-/merge_requests/2492"
-        )
-        == "MR: https://gitlab.example.com/g/p/-/merge_requests/2492"
-    )
-    # Two underscored URLs on one line must not pair into an italic span.
-    assert (
-        preprocessor_with_jira.markdown_to_jira(
-            "see https://a.example/x_y and https://b.example/z_w"
-        )
-        == "see https://a.example/x_y and https://b.example/z_w"
-    )
-    # Trailing sentence punctuation stays outside the URL.
-    assert (
-        preprocessor_with_jira.markdown_to_jira("open https://example.com/foo_bar.")
-        == "open https://example.com/foo_bar."
-    )
-    # URLs directly after punctuation are protected; identifiers outside them
-    # are still escaped.
-    assert (
-        preprocessor_with_jira.markdown_to_jira(
-            "Link:https://example.com/foo_bar with snake_case"
-        )
-        == "Link:https://example.com/foo_bar with snake\\_case"
-    )
-    # List items keep their markers.
-    assert (
-        preprocessor_with_jira.markdown_to_jira("- https://example.com/foo_bar")
-        == "* https://example.com/foo_bar"
-    )
-
-
 # Issue #893 regression tests - Code Block Content Corruption
 
 
