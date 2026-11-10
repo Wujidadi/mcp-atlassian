@@ -1,5 +1,6 @@
 """Tests for the OAuth setup utilities."""
 
+import io
 import json
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
@@ -7,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from mcp_atlassian.utils.oauth_setup import (
+    CallbackHandler,
     OAuthSetupArgs,
     parse_redirect_uri,
     run_oauth_flow,
@@ -43,6 +45,156 @@ class TestCallbackHandlerLogic:
         for key, expected_values in expected_params.items():
             assert key in params
             assert params[key] == expected_values
+
+
+class TestCallbackHandlerXssRegression:
+    """Regression (GHSA-g2r2) — reflected XSS in the OAuth callback page.
+
+    ``CallbackHandler._send_response`` used to interpolate the caller-supplied
+    ``message`` straight into the HTML body (``<p>{message}</p>``). For the error
+    branch that message is built from the attacker-controlled ``error`` query
+    parameter, so a crafted ``?error=<script>…`` rendered executable markup in the
+    victim's browser. This test asserts the secure outcome: the payload is
+    HTML-escaped in the rendered page.
+    """
+
+    @pytest.mark.security_regression
+    def test_send_response_escapes_html_in_message(self) -> None:
+        """A ``<script>`` payload in the callback message must not be reflected raw."""
+        handler = CallbackHandler.__new__(CallbackHandler)
+        # _send_response only touches these members — stub them so no real socket
+        # I/O happens and we can capture the rendered HTML body.
+        handler.wfile = io.BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+
+        payload = "<script>alert('xss-g2r2')</script>"
+        handler._send_response(f"Authorization failed: {payload}")
+
+        body = handler.wfile.getvalue().decode()
+        assert payload not in body, (
+            "attacker-controlled callback message must be HTML-escaped, "
+            "not reflected as raw executable markup"
+        )
+
+
+def _make_handler(path: str) -> CallbackHandler:
+    """Build a CallbackHandler for ``path`` without a real socket."""
+    handler = CallbackHandler.__new__(CallbackHandler)
+    handler.path = path
+    handler.wfile = io.BytesIO()
+    handler.send_response = MagicMock()
+    handler.send_header = MagicMock()
+    handler.end_headers = MagicMock()
+    return handler
+
+
+class TestCallbackHandlerStateBinding:
+    """Callbacks that do not carry the running flow's state are ignored."""
+
+    @pytest.fixture(autouse=True)
+    def reset_oauth_state(self):
+        import mcp_atlassian.utils.oauth_setup as oauth_module
+
+        oauth_module.authorization_code = None
+        oauth_module.authorization_state = None
+        oauth_module.callback_received = False
+        oauth_module.callback_error = None
+        oauth_module.expected_state = "expected-state"
+        yield
+        oauth_module.expected_state = None
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/callback?code=attacker-code&state=wrong",
+            "/callback?code=attacker-code",
+            "/callback?error=access_denied&state=wrong",
+            "/callback?error=access_denied",
+        ],
+    )
+    def test_callback_without_matching_state_is_ignored(self, path) -> None:
+        import mcp_atlassian.utils.oauth_setup as oauth_module
+
+        handler = _make_handler(path)
+        handler.do_GET()
+
+        handler.send_response.assert_called_once_with(400)
+        assert oauth_module.callback_received is False
+        assert oauth_module.authorization_code is None
+        assert oauth_module.callback_error is None
+
+    def test_callback_with_matching_state_is_recorded(self) -> None:
+        import mcp_atlassian.utils.oauth_setup as oauth_module
+
+        handler = _make_handler("/callback?code=real-code&state=expected-state")
+        handler.do_GET()
+
+        handler.send_response.assert_called_once_with(200)
+        assert oauth_module.callback_received is True
+        assert oauth_module.authorization_code == "real-code"
+        assert oauth_module.authorization_state == "expected-state"
+
+    def test_callback_is_ignored_when_no_flow_is_running(self) -> None:
+        import mcp_atlassian.utils.oauth_setup as oauth_module
+
+        oauth_module.expected_state = None
+        handler = _make_handler("/callback?code=real-code&state=expected-state")
+        handler.do_GET()
+
+        assert oauth_module.callback_received is False
+
+
+class TestCallbackServerBinding:
+    """The callback server listens on loopback only."""
+
+    def test_start_callback_server_binds_loopback(self) -> None:
+        from mcp_atlassian.utils import oauth_setup
+
+        httpd = oauth_setup.start_callback_server(0)
+        try:
+            assert httpd.server_address[0] == "127.0.0.1"
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class TestAuthorizationUrlLogging:
+    """The authorization URL carries the CSRF state and stays out of logs."""
+
+    def test_run_oauth_flow_logs_authorization_url_without_query(
+        self, caplog, capsys
+    ) -> None:
+        import mcp_atlassian.utils.oauth_setup as oauth_module
+
+        auth_url = "https://auth.atlassian.com/authorize?client_id=c&state=SECRET-STATE"
+        with (
+            patch("mcp_atlassian.utils.oauth_setup.OAuthConfig") as mock_config,
+            patch("mcp_atlassian.utils.oauth_setup.webbrowser.open"),
+            patch(
+                "mcp_atlassian.utils.oauth_setup.wait_for_callback",
+                return_value=False,
+            ),
+            patch("mcp_atlassian.utils.oauth_setup.start_callback_server"),
+            caplog.at_level("DEBUG", logger="mcp-atlassian.oauth-setup"),
+        ):
+            mock_config.return_value.get_authorization_url.return_value = auth_url
+            assert (
+                oauth_module.run_oauth_flow(
+                    OAuthSetupArgs(
+                        client_id="c",
+                        client_secret="s",
+                        redirect_uri="http://localhost:8080/callback",
+                        scope="read:jira-work",
+                    )
+                )
+                is False
+            )
+
+        assert "SECRET-STATE" not in caplog.text
+        assert "https://auth.atlassian.com/authorize" in caplog.text
+        assert auth_url in capsys.readouterr().err
 
 
 class TestRedirectUriParsing:

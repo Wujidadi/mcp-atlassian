@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import uuid
+from typing import Any
 
 import pytest
 import requests
@@ -11,6 +13,29 @@ from requests.exceptions import HTTPError
 from mcp_atlassian.jira import JiraFetcher
 
 from .conftest import CloudInstanceInfo, CloudResourceTracker
+
+
+def _delete_cloud_comment(
+    jira_fetcher: JiraFetcher, issue_key: str, comment_id: str
+) -> None:
+    """Best-effort cleanup for a comment created by the JSM e2e test."""
+    try:
+        jira_fetcher.jira.delete(f"rest/api/3/issue/{issue_key}/comment/{comment_id}")
+    except requests.RequestException:
+        pass
+
+
+def _cloud_jsm_project_key(
+    cloud_instance: CloudInstanceInfo, issue_key: str | None = None
+) -> str:
+    """Return the explicitly configured JSM project or the E2E project."""
+    configured = os.environ.get("CLOUD_E2E_JSM_PROJECT_KEY", "").strip()
+    if configured:
+        return configured.upper()
+    if issue_key and "-" in issue_key:
+        return issue_key.split("-", 1)[0].strip().upper()
+    return cloud_instance.project_key.strip().upper()
+
 
 pytestmark = pytest.mark.cloud_e2e
 
@@ -62,6 +87,31 @@ class TestJiraCloudBehavior:
             project.get("key", "").upper() == cloud_instance.project_key
             for project in projects
         )
+
+
+class TestJiraCloudProjectAnalysis:
+    """Project analysis through Jira Cloud search pagination."""
+
+    def test_project_analysis(
+        self,
+        jira_fetcher: JiraFetcher,
+        cloud_instance: CloudInstanceInfo,
+    ) -> None:
+        hierarchy = jira_fetcher.get_project_epic_hierarchy(
+            cloud_instance.project_key,
+            max_epics=10,
+        )
+        dependencies = jira_fetcher.get_cross_project_dependencies(
+            cloud_instance.project_key,
+            max_issues=10,
+        )
+
+        assert hierarchy["project_key"] == cloud_instance.project_key
+        assert hierarchy["total_epics"] <= 10
+        assert isinstance(hierarchy["groups"], list)
+        assert dependencies["project_key"] == cloud_instance.project_key
+        assert dependencies["total_issues_scanned"] <= 10
+        assert isinstance(dependencies["by_project"], dict)
 
 
 class TestJiraCloudEpicOperations:
@@ -277,8 +327,16 @@ class TestJiraCloudTransitions:
         )
         resource_tracker.add_jira_issue(issue.key)
 
-        transitions = jira_fetcher.get_transitions(issue.key)
+        transitions = jira_fetcher.get_available_transitions(
+            issue.key, expand_fields=True
+        )
         assert len(transitions) > 0
+        assert all(isinstance(t["has_screen"], bool) for t in transitions)
+        for transition in transitions:
+            assert all(
+                field.get("key") and field.get("name")
+                for field in transition.get("required_fields", [])
+            )
 
         # Find "In Progress" transition or use first available
         target_id = None
@@ -289,8 +347,140 @@ class TestJiraCloudTransitions:
                 break
         if target_id is None:
             target_id = transitions[0]["id"]
+        target = next(t for t in transitions if t["id"] == target_id)
 
-        jira_fetcher.transition_issue(issue.key, target_id)
+        # Plain text inside update_data must be converted to ADF for REST v3.
+        # Jira allows one comment operation per transition, so the comment
+        # goes through update_data instead of the comment argument.
+        update_data: dict[str, Any] = {
+            "comment": [{"add": {"body": f"Cloud transition update comment {uid}"}}]
+        }
+        # Jira accepts a worklog only when the transition has a screen that
+        # carries the field; the shared Cloud project uses screenless transitions.
+        if target["has_screen"]:
+            update_data["worklog"] = [
+                {
+                    "add": {
+                        "timeSpent": "1m",
+                        "comment": f"Cloud transition worklog {uid}",
+                    }
+                }
+            ]
+
+        jira_fetcher.transition_issue(
+            issue.key,
+            target_id,
+            update_data=update_data,
+        )
 
         updated = jira_fetcher.get_issue(issue.key)
         assert updated.status is not None
+        if target["has_screen"]:
+            # Jira Cloud drops comment and worklog updates on screenless
+            # transitions, so the text is only checked when a screen exists.
+            comments = jira_fetcher.get_issue_comments(issue.key)
+            bodies = " ".join(str(c.get("body", "")) for c in comments)
+            assert f"Cloud transition update comment {uid}" in bodies
+
+
+class TestJiraCloudJSMComments:
+    """ServiceDesk visibility and internal-only comment behavior on Cloud."""
+
+    def test_internal_only_comment_guard_matches_servicedesk_visibility(
+        self,
+        jira_fetcher: JiraFetcher,
+        cloud_instance: CloudInstanceInfo,
+        resource_tracker: CloudResourceTracker,
+    ) -> None:
+        existing_issue_key = os.environ.get("CLOUD_E2E_JSM_ISSUE_KEY", "").strip()
+        project_key = _cloud_jsm_project_key(cloud_instance, existing_issue_key)
+        project = jira_fetcher.jira.get(f"rest/api/3/project/{project_key}")
+        if not isinstance(project, dict) or project.get("projectTypeKey") not in {
+            "service_desk",
+            "service-desk",
+        }:
+            pytest.skip(
+                f"CLOUD_E2E_JSM_PROJECT_KEY is not a Jira Service Management "
+                f"project: {project_key}"
+            )
+
+        issue_key = existing_issue_key
+        if not issue_key:
+            issue = jira_fetcher.create_issue(
+                project_key=project_key,
+                summary=f"Cloud E2E JSM comment test {uuid.uuid4().hex[:8]}",
+                issue_type=os.environ.get("CLOUD_E2E_JSM_ISSUE_TYPE", "Task"),
+            )
+            issue_key = issue.key
+            resource_tracker.add_jira_issue(issue_key)
+
+        comment_ids: list[str] = []
+        try:
+            public_comment = jira_fetcher.add_comment(
+                issue_key, "Cloud public ServiceDesk comment", public=True
+            )
+            internal_comment = jira_fetcher.add_comment(
+                issue_key, "Cloud internal ServiceDesk comment", public=False
+            )
+            public_id = str(public_comment["id"])
+            internal_id = str(internal_comment["id"])
+            comment_ids.extend((public_id, internal_id))
+
+            assert public_comment["public"] is True
+            assert internal_comment["public"] is False
+            assert (
+                jira_fetcher._fetch_servicedesk_comment_is_public(issue_key, public_id)
+                is True
+            )
+            assert (
+                jira_fetcher._fetch_servicedesk_comment_is_public(
+                    issue_key, internal_id
+                )
+                is False
+            )
+
+            jira_fetcher.config.internal_only_projects = frozenset({project_key})
+
+            # The add guard is the actual boundary: on a listed project a
+            # customer-visible comment must be refused outright, and an omitted
+            # 'public' must not quietly default to one.
+            with pytest.raises(ValueError, match="internal-only"):
+                jira_fetcher.add_comment(
+                    issue_key, "must never reach the customer", public=True
+                )
+            with pytest.raises(ValueError, match="internal-only"):
+                jira_fetcher.add_comment(issue_key, "must never reach the customer")
+
+            # ...while an explicit internal comment still gets through — this is
+            # exactly what the MCP boundary used to drop.
+            guarded = jira_fetcher.add_comment(
+                issue_key, "Cloud guarded internal comment", public=False
+            )
+            guarded_id = str(guarded["id"])
+            comment_ids.append(guarded_id)
+            assert guarded["public"] is False
+            assert (
+                jira_fetcher._fetch_servicedesk_comment_is_public(issue_key, guarded_id)
+                is False
+            )
+
+            with pytest.raises(ValueError, match="PUBLIC"):
+                jira_fetcher.edit_comment(issue_key, public_id, "must remain unchanged")
+
+            edited = jira_fetcher.edit_comment(
+                issue_key, internal_id, "Cloud edited internal ServiceDesk comment"
+            )
+            assert edited["id"] == internal_id
+            # The edit itself goes through the core Jira API, so assert the
+            # comment is still internal afterwards: if that write ever dropped
+            # the ServiceDesk visibility property, the guard would have let the
+            # text through to the customer portal while the test still passed.
+            assert (
+                jira_fetcher._fetch_servicedesk_comment_is_public(
+                    issue_key, internal_id
+                )
+                is False
+            )
+        finally:
+            for comment_id in comment_ids:
+                _delete_cloud_comment(jira_fetcher, issue_key, comment_id)

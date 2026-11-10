@@ -6,6 +6,7 @@ corresponding v1 endpoints are deprecated or unavailable.
 
 import logging
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from requests.exceptions import HTTPError
@@ -85,6 +86,7 @@ class ConfluenceV2Adapter:
         parent_id: str | None = None,
         representation: str = "storage",
         status: str = "current",
+        subtype: str | None = None,
     ) -> dict[str, Any]:
         """Create a page using the v2 API.
 
@@ -95,6 +97,7 @@ class ConfluenceV2Adapter:
             parent_id: Optional parent page ID
             representation: Content representation format (default: "storage")
             status: Page status (default: "current")
+            subtype: Optional page subtype. Use "live" to create a Live Doc.
 
         Returns:
             The created page data from the API response
@@ -120,6 +123,8 @@ class ConfluenceV2Adapter:
             # Add parent if specified
             if parent_id:
                 data["parentId"] = parent_id
+            if subtype:
+                data["subtype"] = subtype
 
             # Make the v2 API call
             url = f"{self.base_url}/api/v2/pages"
@@ -555,6 +560,9 @@ class ConfluenceV2Adapter:
                 }
             }
 
+        if "subtype" in v2_response:
+            v1_compatible["subtype"] = v2_response["subtype"]
+
         return v1_compatible
 
     def create_footer_comment(
@@ -607,7 +615,15 @@ class ConfluenceV2Adapter:
             result = response.json()
             logger.debug("Successfully created footer comment with v2 API")
 
-            return self._convert_v2_comment_to_v1_format(result)
+            converted = self._convert_v2_comment_to_v1_format(result)
+            if not converted["body"]["view"]["value"]:
+                comment_id = result.get("id")
+                if comment_id:
+                    refreshed = self.get_footer_comment(str(comment_id))
+                    if refreshed:
+                        converted = self._convert_v2_comment_to_v1_format(refreshed)
+
+            return converted
 
         except Exception as e:
             if isinstance(e, ValueError | HTTPError):
@@ -615,19 +631,41 @@ class ConfluenceV2Adapter:
             logger.error(f"Error creating footer comment: {e}")
             raise ValueError(f"Failed to create footer comment: {e}") from e
 
+    def get_footer_comment(self, comment_id: str) -> dict[str, Any] | None:
+        """Fetch a footer comment body after an incomplete create response.
+
+        Args:
+            comment_id: The ID of the created footer comment.
+
+        Returns:
+            The raw v2 comment response, or None if refresh fails.
+        """
+        try:
+            url = f"{self.base_url}/api/v2/footer-comments/{comment_id}"
+            response = self.session.get(url, params={"body-format": "storage"})
+            response.raise_for_status()
+            return response.json()
+        except (requests.RequestException, ValueError, TypeError) as e:
+            logger.debug(
+                "Failed to refresh footer comment %s after create: %s",
+                comment_id,
+                e,
+            )
+            return None
+
     def get_inline_comments(
         self,
         page_id: str,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Get inline comments for a page using the v2 API.
+        """Get all inline comment threads for a page using the v2 API.
 
         Args:
             page_id: The ID of the page to get inline comments from
             status: Optional filter - "open" or "resolved"
 
         Returns:
-            List of inline comments in v1-compatible format
+            Root comments and replies in a flat, v1-compatible list
 
         Raises:
             ValueError: If the API request fails
@@ -638,12 +676,50 @@ class ConfluenceV2Adapter:
             if status:
                 params["status"] = status
 
-            response = self.session.get(url, params=params)
-            response.raise_for_status()
+            root_comments = self._get_all_comment_results(url, params=params)
+            comments: list[dict[str, Any]] = []
+            pending_parent_ids: list[str] = []
+            seen_comment_ids: set[str] = set()
 
-            data = response.json()
-            results = data.get("results", [])
-            return [self._convert_v2_inline_comment_to_v1_format(r) for r in results]
+            for root_comment in root_comments:
+                comment = dict(root_comment)
+                comment_id = comment.get("id")
+                if comment_id is not None:
+                    comment_id = str(comment_id)
+                    if comment_id in seen_comment_ids:
+                        continue
+                    seen_comment_ids.add(comment_id)
+                    pending_parent_ids.append(comment_id)
+                comments.append(comment)
+
+            parent_index = 0
+            while parent_index < len(pending_parent_ids):
+                parent_id = pending_parent_ids[parent_index]
+                parent_index += 1
+                children_url = (
+                    f"{self.base_url}/api/v2/inline-comments/{parent_id}/children"
+                )
+                children = self._get_all_comment_results(
+                    children_url,
+                    params={"body-format": "storage"},
+                )
+
+                for raw_child in children:
+                    child = dict(raw_child)
+                    child.setdefault("parentCommentId", parent_id)
+                    child_id = child.get("id")
+                    if child_id is not None:
+                        child_id = str(child_id)
+                        if child_id in seen_comment_ids:
+                            continue
+                        seen_comment_ids.add(child_id)
+                        pending_parent_ids.append(child_id)
+                    comments.append(child)
+
+            return [
+                self._convert_v2_inline_comment_to_v1_format(comment)
+                for comment in comments
+            ]
 
         except HTTPError as e:
             if e.response is not None:
@@ -664,6 +740,65 @@ class ConfluenceV2Adapter:
             logger.error(f"Error getting inline comments for page '{page_id}': {e}")
             msg = f"Failed to get inline comments for page '{page_id}': {e}"
             raise ValueError(msg) from e
+
+    @staticmethod
+    def _comment_next_cursor(
+        response: requests.Response, data: dict[str, Any]
+    ) -> str | None:
+        """Extract a Confluence v2 cursor from JSON or the Link header."""
+        next_url: str | None = None
+        links = data.get("_links")
+        if isinstance(links, dict) and isinstance(links.get("next"), str):
+            next_url = links["next"]
+
+        if not next_url:
+            response_links = getattr(response, "links", None)
+            if isinstance(response_links, dict):
+                next_link = response_links.get("next")
+                if isinstance(next_link, dict) and isinstance(
+                    next_link.get("url"), str
+                ):
+                    next_url = next_link["url"]
+
+        if not next_url:
+            return None
+
+        return parse_qs(urlparse(next_url).query).get("cursor", [None])[0]
+
+    def _get_all_comment_results(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Read every cursor page from a v2 comment collection endpoint."""
+        results: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str | None] = set()
+
+        while cursor not in seen_cursors:
+            seen_cursors.add(cursor)
+            request_params = dict(params)
+            if cursor is not None:
+                request_params["cursor"] = cursor
+
+            response = self.session.get(url, params=request_params)
+            response.raise_for_status()
+            data = response.json()
+            page_results = data.get("results", [])
+            if not isinstance(page_results, list):
+                break
+            results.extend(item for item in page_results if isinstance(item, dict))
+
+            cursor = self._comment_next_cursor(response, data)
+            if not cursor:
+                break
+        else:
+            logger.warning(
+                "Stopping comment pagination after repeated cursor '%s'", cursor
+            )
+
+        return results
 
     def create_inline_comment(
         self,
@@ -765,8 +900,14 @@ class ConfluenceV2Adapter:
         if author := v2_response.get("author"):
             v1_compatible["author"] = author
 
-        if inline_props := v2_response.get("inlineCommentProperties"):
-            v1_compatible["inlineCommentProperties"] = inline_props
+        for field in (
+            "inlineCommentProperties",
+            "properties",
+            "resolutionStatus",
+            "parentCommentId",
+        ):
+            if field in v2_response:
+                v1_compatible[field] = v2_response[field]
 
         return v1_compatible
 

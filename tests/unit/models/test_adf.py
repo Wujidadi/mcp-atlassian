@@ -541,6 +541,33 @@ class TestMarkdownToAdf:
         ]
         assert mention_ids == [a, b]
 
+    @pytest.mark.parametrize(
+        ("issue_key", "should_link"),
+        [
+            ("PROJ-123", True),
+            ("B7-214-68901", True),
+            ("B7-214--68901", False),
+            ("B7-214-68901A", False),
+        ],
+    )
+    def test_jira_issue_key_links_to_browse_url(
+        self, issue_key: str, should_link: bool
+    ) -> None:
+        """Valid Jira issue keys become links without matching malformed keys."""
+        result = markdown_to_adf(
+            f"Blocked by {issue_key}.",
+            jira_base_url="https://jira.example.com/",
+        )
+        para = result["content"][0]
+        issue_node = next(n for n in para["content"] if issue_key in n.get("text", ""))
+        link_marks = [m for m in issue_node.get("marks", []) if m["type"] == "link"]
+        if should_link:
+            assert link_marks[0]["attrs"]["href"] == (
+                f"https://jira.example.com/browse/{issue_key}"
+            )
+        else:
+            assert not link_marks
+
     # -- Code blocks --------------------------------------------------------
 
     def test_code_block_with_lang(self):
@@ -585,6 +612,23 @@ class TestMarkdownToAdf:
         for item in items:
             assert item["type"] == "listItem"
             assert item["content"][0]["type"] == "paragraph"
+
+    @pytest.mark.parametrize(
+        "md",
+        [
+            "1. first\n\n2. second\n\n3. third",
+            "1. first\n\n1. second\n\n1. third",
+        ],
+    )
+    def test_ordered_list_with_blank_lines(self, md: str) -> None:
+        """Blank lines between items keep one loose ordered list."""
+        result = markdown_to_adf(md)
+        ordered_lists = [
+            node for node in result["content"] if node["type"] == "orderedList"
+        ]
+
+        assert len(ordered_lists) == 1
+        assert len(ordered_lists[0]["content"]) == 3
 
     def test_task_list_checked(self):
         """- [x] items produce a taskList with taskItem state=DONE."""
@@ -641,6 +685,40 @@ class TestMarkdownToAdf:
         rule_nodes = [n for n in result["content"] if n["type"] == "rule"]
         assert len(rule_nodes) >= 1
 
+    # -- Expand/collapse block ----------------------------------------------
+
+    def test_expand_with_title(self) -> None:
+        """Expand block with title produces an expand node."""
+        md = "{expand:Details}\n* bullet one\n* bullet two\n{expand}"
+        result = markdown_to_adf(md)
+        expand = next(n for n in result["content"] if n["type"] == "expand")
+        assert expand["attrs"]["title"] == "Details"
+        assert any(n["type"] == "bulletList" for n in expand["content"])
+
+    def test_expand_without_title(self) -> None:
+        """Expand block without a title uses an empty string."""
+        md = "{expand}\nSome content\n{expand}"
+        result = markdown_to_adf(md)
+        expand = next(n for n in result["content"] if n["type"] == "expand")
+        assert expand["attrs"]["title"] == ""
+        assert any(n["type"] == "paragraph" for n in expand["content"])
+
+    def test_expand_with_nested_formatting(self) -> None:
+        """Expand block recursively parses inner markdown."""
+        md = "{expand:Steps}\n## Heading\n1. First\n1. Second\n{expand}"
+        result = markdown_to_adf(md)
+        expand = next(n for n in result["content"] if n["type"] == "expand")
+        inner_types = [n["type"] for n in expand["content"]]
+        assert "heading" in inner_types
+        assert "orderedList" in inner_types
+
+    def test_expand_preserves_surrounding_content(self) -> None:
+        """Content before and after expand block is preserved."""
+        md = "Before\n{expand:Title}\nInside\n{expand}\nAfter"
+        result = markdown_to_adf(md)
+        types = [n["type"] for n in result["content"]]
+        assert types == ["paragraph", "expand", "paragraph"]
+
     # -- Mixed formatting ---------------------------------------------------
 
     def test_mixed_formatting(self):
@@ -694,6 +772,55 @@ class TestMarkdownToAdf:
         # Verify data values
         data_texts = [c["content"][0]["content"][0]["text"] for c in rows[1]["content"]]
         assert data_texts == ["Alice", "30"]
+
+    def test_keeps_dash_only_row(self):
+        """A later dash-only row is data, not a second delimiter.
+
+        A single "-" is a common way to write "not applicable", and dropping it
+        removes a row of real content with nothing logged.
+        """
+        md = (
+            "| Environment | Owner | Notes |\n"
+            "|---|---|---|\n"
+            "| prod | alice | migrated |\n"
+            "| - | - | - |\n"
+            "| dev | bob | migrated |"
+        )
+        rows = next(n for n in markdown_to_adf(md)["content"] if n["type"] == "table")[
+            "content"
+        ]
+        assert len(rows) == 4  # header + 3 data rows
+        texts = [
+            [c["content"][0]["content"][0]["text"] for c in row["content"]]
+            for row in rows
+        ]
+        assert texts[2] == ["-", "-", "-"]
+
+    def test_keeps_empty_row(self):
+        """An empty row after the delimiter is data, not another delimiter."""
+        md = "| A | B |\n|---|---|\n| 1 | 2 |\n|  |  |\n| 3 | 4 |"
+        rows = next(n for n in markdown_to_adf(md)["content"] if n["type"] == "table")[
+            "content"
+        ]
+        texts = [
+            [c["content"][0]["content"][0]["text"] for c in row["content"]]
+            for row in rows
+        ]
+        assert texts == [["A", "B"], ["1", "2"], ["", ""], ["3", "4"]]
+
+    def test_drops_delimiter_row(self):
+        """Every delimiter spelling stays recognised at its own position."""
+        for separator in ("|---|---|", "|:---|---:|", "|-|-|", "|:-:|:-:|"):
+            md = f"| A | B |\n{separator}\n| 1 | 2 |"
+            rows = next(
+                n for n in markdown_to_adf(md)["content"] if n["type"] == "table"
+            )["content"]
+            assert len(rows) == 2, f"{separator} was not treated as a delimiter"
+            texts = [
+                [c["content"][0]["content"][0]["text"] for c in row["content"]]
+                for row in rows
+            ]
+            assert texts == [["A", "B"], ["1", "2"]]
 
     def test_table_with_inline_formatting(self):
         """Table cells preserve inline formatting (bold, code)."""
@@ -893,6 +1020,93 @@ class TestMarkdownToAdfPanels:
         result = markdown_to_adf("## Heading\n\n:::note\nA note.\n:::\n\n- list item")
         types = [n["type"] for n in result["content"]]
         assert types == ["heading", "panel", "bulletList"]
+
+
+class TestMarkdownToAdfStatus:
+    """Tests for inline status lozenge support in markdown_to_adf."""
+
+    def _inline_nodes(self, markdown: str) -> list[dict[str, Any]]:
+        """Helper: return the inline nodes of the first paragraph."""
+        result = markdown_to_adf(markdown)
+        return result["content"][0]["content"]
+
+    @pytest.mark.parametrize(
+        "color",
+        ["neutral", "purple", "blue", "red", "yellow", "green"],
+    )
+    def test_all_valid_colors(self, color: str) -> None:
+        """Every supported color is passed through to the status node."""
+        nodes = self._inline_nodes(f"{{status:color={color}|title=Done}}")
+        assert nodes[0]["type"] == "status"
+        assert nodes[0]["attrs"] == {"text": "Done", "color": color, "style": ""}
+
+    def test_color_is_optional(self) -> None:
+        """Omitting color defaults to neutral."""
+        nodes = self._inline_nodes("{status:title=In Progress}")
+        assert nodes[0]["type"] == "status"
+        assert nodes[0]["attrs"]["color"] == "neutral"
+        assert nodes[0]["attrs"]["text"] == "In Progress"
+
+    def test_unknown_color_becomes_neutral(self) -> None:
+        """An unrecognized color does not produce an invalid ADF node."""
+        nodes = self._inline_nodes("{status:color=chartreuse|title=Blocked}")
+        assert nodes[0]["attrs"]["color"] == "neutral"
+        assert nodes[0]["attrs"]["text"] == "Blocked"
+
+    def test_color_is_case_insensitive(self) -> None:
+        """Color matching is not case sensitive."""
+        nodes = self._inline_nodes("{status:color=GREEN|title=Done}")
+        assert nodes[0]["attrs"]["color"] == "green"
+
+    def test_status_alongside_surrounding_text(self) -> None:
+        """Text before and after a lozenge is preserved."""
+        nodes = self._inline_nodes("Ticket is {status:color=green|title=Done} now")
+        assert [n["type"] for n in nodes] == ["text", "status", "text"]
+        assert nodes[0]["text"] == "Ticket is "
+        assert nodes[2]["text"] == " now"
+
+    def test_multiple_statuses_in_one_line(self) -> None:
+        """Several lozenges can appear in the same paragraph."""
+        nodes = self._inline_nodes(
+            "{status:color=red|title=Blocked} then {status:color=green|title=Done}"
+        )
+        statuses = [n for n in nodes if n["type"] == "status"]
+        assert [s["attrs"]["text"] for s in statuses] == ["Blocked", "Done"]
+        assert [s["attrs"]["color"] for s in statuses] == ["red", "green"]
+
+    def test_status_with_inline_formatting(self) -> None:
+        """Lozenges coexist with bold and inline code."""
+        nodes = self._inline_nodes("**bold** {status:color=blue|title=Review} `code`")
+        types = [n["type"] for n in nodes]
+        assert "status" in types
+        assert any(n.get("marks") == [{"type": "strong"}] for n in nodes)
+        assert any(n.get("marks") == [{"type": "code"}] for n in nodes)
+
+    def test_backticked_status_stays_literal(self) -> None:
+        """A lozenge inside inline code is not converted."""
+        nodes = self._inline_nodes("`{status:color=red|title=Blocked}`")
+        assert [n["type"] for n in nodes] == ["text"]
+        assert nodes[0]["marks"] == [{"type": "code"}]
+        assert nodes[0]["text"] == "{status:color=red|title=Blocked}"
+
+    def test_malformed_status_is_left_as_text(self) -> None:
+        """A lozenge missing its title is not converted."""
+        nodes = self._inline_nodes("{status:color=red}")
+        assert all(n["type"] != "status" for n in nodes)
+
+    def test_status_in_list_item(self) -> None:
+        """Lozenges work inside list items, not just paragraphs."""
+        result = markdown_to_adf("- item {status:color=yellow|title=WIP}")
+        item = result["content"][0]["content"][0]
+        inline = item["content"][0]["content"]
+        assert any(n["type"] == "status" for n in inline)
+
+    def test_round_trip_through_adf_to_text(self) -> None:
+        """A written lozenge is readable again via the ADF read path."""
+        adf = markdown_to_adf("Rollout is {status:color=green|title=Done} today")
+        text = adf_to_text(adf)
+        assert "[Done]" in text
+        assert "Rollout is" in text
 
 
 class TestMarkdownToJiraDispatch:

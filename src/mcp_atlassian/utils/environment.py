@@ -3,6 +3,7 @@
 import logging
 import os
 
+from .env import is_env_truthy
 from .urls import is_atlassian_cloud_url
 
 logger = logging.getLogger("mcp-atlassian.utils.environment")
@@ -17,6 +18,7 @@ def _check_service_auth(
     username_env: str,
     api_env: str,
     pat_env: str,
+    client_cert_env: str | None = None,
 ) -> bool:
     """Detect whether a single Atlassian service is authenticated.
 
@@ -29,6 +31,8 @@ def _check_service_auth(
         username_env: Env var name for the Basic Auth username.
         api_env: Env var name for the Basic Auth API token / password.
         pat_env: Env var name for the Personal Access Token (Server/DC only).
+        client_cert_env: Env var name for the client certificate path
+            (mTLS, Server/DC only).
 
     Returns:
         ``True`` when a valid auth configuration is detected, ``False`` otherwise.
@@ -79,6 +83,9 @@ def _check_service_auth(
                 service_name,
             )
             return True
+        if client_cert_env and os.getenv(client_cert_env):
+            logger.info("Using %s mTLS client certificate authentication", service_name)
+            return True
 
     return False
 
@@ -107,6 +114,7 @@ def get_available_services(
             username_env="CONFLUENCE_USERNAME",
             api_env="CONFLUENCE_API_TOKEN",
             pat_env="CONFLUENCE_PERSONAL_TOKEN",
+            client_cert_env="CONFLUENCE_CLIENT_CERT",
         )
 
     if not confluence_is_setup and os.getenv("ATLASSIAN_OAUTH_ENABLE", "").lower() in (
@@ -119,6 +127,23 @@ def get_available_services(
             "Using Confluence minimal OAuth configuration "
             "- expecting user-provided tokens via headers"
         )
+
+    if not confluence_is_setup and is_env_truthy("ATLASSIAN_EXTERNAL_AUTH_ENABLE"):
+        confluence_is_setup = True
+        logger.info(
+            "Using Confluence external auth passthrough mode "
+            "- auth headers injected by upstream proxy"
+        )
+
+    if not confluence_is_setup:
+        from mcp_atlassian.utils.credential_command import get_resolver
+
+        if get_resolver().has_deferred_credentials("confluence"):
+            confluence_is_setup = True
+            logger.info(
+                "Confluence has deferred credential commands configured "
+                "- credentials will be resolved on first use"
+            )
 
     if not confluence_is_setup:
         confluence_token = headers.get("X-Atlassian-Confluence-Personal-Token")
@@ -146,6 +171,7 @@ def get_available_services(
             username_env="JIRA_USERNAME",
             api_env="JIRA_API_TOKEN",
             pat_env="JIRA_PERSONAL_TOKEN",
+            client_cert_env="JIRA_CLIENT_CERT",
         )
 
     if not jira_is_setup and os.getenv("ATLASSIAN_OAUTH_ENABLE", "").lower() in (
@@ -158,6 +184,23 @@ def get_available_services(
             "Using Jira minimal OAuth configuration "
             "- expecting user-provided tokens via headers"
         )
+
+    if not jira_is_setup and is_env_truthy("ATLASSIAN_EXTERNAL_AUTH_ENABLE"):
+        jira_is_setup = True
+        logger.info(
+            "Using Jira external auth passthrough mode "
+            "- auth headers injected by upstream proxy"
+        )
+
+    if not jira_is_setup:
+        from mcp_atlassian.utils.credential_command import get_resolver as _get_resolver
+
+        if _get_resolver().has_deferred_credentials("jira"):
+            jira_is_setup = True
+            logger.info(
+                "Jira has deferred credential commands configured "
+                "- credentials will be resolved on first use"
+            )
 
     if not jira_is_setup:
         jira_token = headers.get("X-Atlassian-Jira-Personal-Token")

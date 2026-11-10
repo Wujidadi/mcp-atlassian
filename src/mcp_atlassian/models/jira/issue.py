@@ -6,6 +6,7 @@ This module provides Pydantic models for Jira issues.
 
 import logging
 import re
+from collections.abc import Collection
 from typing import Any, Literal
 
 from pydantic import Field
@@ -49,6 +50,27 @@ EPIC_LINK_PATTERNS = [
 ]
 
 
+def _reference_project(ref: Any) -> str | None:
+    """Return the upper-cased project key of an issue reference, or None.
+
+    Uses ``fields.project.key`` when the reference carries it, otherwise the
+    prefix of the issue key Jira returned (the current key of the issue).
+    """
+    if not isinstance(ref, dict):
+        return None
+    fields = ref.get("fields")
+    project = fields.get("project") if isinstance(fields, dict) else None
+    project_key = project.get("key") if isinstance(project, dict) else None
+    if isinstance(project_key, str) and project_key.strip():
+        return project_key.strip().upper()
+    key = ref.get("key")
+    if isinstance(key, str) and "-" in key:
+        prefix = key.rsplit("-", 1)[0].strip()
+        if prefix:
+            return prefix.upper()
+    return None
+
+
 class JiraIssue(ApiModel, TimestampMixin):
     """
     Model representing a Jira issue.
@@ -61,6 +83,7 @@ class JiraIssue(ApiModel, TimestampMixin):
     key: str = JIRA_DEFAULT_KEY
     summary: str = EMPTY_STRING
     description: str | None = None
+    environment: str | None = None
     created: str = EMPTY_STRING
     updated: str = EMPTY_STRING
     status: JiraStatus | None = None
@@ -74,9 +97,11 @@ class JiraIssue(ApiModel, TimestampMixin):
     attachments: list[JiraAttachment] = Field(default_factory=list)
     timetracking: JiraTimetracking | None = None
     url: str | None = None
+    browse_url: str | None = None
     epic_key: str | None = None
     epic_name: str | None = None
     fix_versions: list[str] = Field(default_factory=list)
+    versions: list[str] = Field(default_factory=list)
     custom_fields: dict[str, Any] = Field(default_factory=dict)
     requested_fields: Literal["*all"] | list[str] | None = None
     project: JiraProject | None = None
@@ -240,6 +265,14 @@ class JiraIssue(ApiModel, TimestampMixin):
 
         return None
 
+    @staticmethod
+    def _build_browse_url(base_url: Any, key: str) -> str | None:
+        if not isinstance(base_url, str) or not base_url.strip():
+            return None
+        if key == JIRA_DEFAULT_KEY:
+            return None
+        return f"{base_url.strip().rstrip('/')}/browse/{key}"
+
     @classmethod
     def from_api_response(cls, data: dict[str, Any], **kwargs: Any) -> "JiraIssue":
         """
@@ -276,6 +309,14 @@ class JiraIssue(ApiModel, TimestampMixin):
             description = adf_to_text(raw_description)
         else:
             description = raw_description
+
+        # Handle environment - like description, it can be a string (Server/DC,
+        # classic editor) or an ADF dict (Jira Cloud new editor)
+        raw_environment = fields.get("environment")
+        if isinstance(raw_environment, dict):
+            environment = adf_to_text(raw_environment)
+        else:
+            environment = raw_environment
 
         # Timestamps
         created = str(fields.get("created", EMPTY_STRING))
@@ -373,6 +414,17 @@ class JiraIssue(ApiModel, TimestampMixin):
                     if version
                 ]
 
+        versions = []
+        if versions_data := fields.get("versions"):
+            if isinstance(versions_data, list):
+                versions = [
+                    str(version.get("name", ""))
+                    if isinstance(version, dict)
+                    else str(version)
+                    for version in versions_data
+                    if version
+                ]
+
         # Handling comments
         comments = []
         comments_field = fields.get("comment", {})
@@ -412,6 +464,7 @@ class JiraIssue(ApiModel, TimestampMixin):
 
         # URL
         url = data.get("self")  # API URL for the issue
+        browse_url = cls._build_browse_url(kwargs.get("base_url"), key)
 
         # Try to find epic fields (varies by Jira instance)
         epic_key = None
@@ -450,11 +503,12 @@ class JiraIssue(ApiModel, TimestampMixin):
             requested_fields_param = [field.strip() for field in requested_fields_param]
 
         # Create the issue instance with all the extracted data
-        return cls(
+        issue = cls(
             id=issue_id,
             key=key,
             summary=summary,
             description=description,
+            environment=environment,
             created=created,
             updated=updated,
             status=status,
@@ -476,14 +530,52 @@ class JiraIssue(ApiModel, TimestampMixin):
             attachments=attachments,
             timetracking=timetracking,
             url=url,
+            browse_url=browse_url,
             epic_key=epic_key,
             epic_name=epic_name,
             fix_versions=fix_versions,
+            versions=versions,
             custom_fields=custom_fields,
             requested_fields=requested_fields_param,
             changelogs=changelogs,
             issuelinks=cls._extract_issue_links(fields),
         )
+        allowed_projects = kwargs.get("allowed_projects")
+        if allowed_projects:
+            issue.restrict_references(allowed_projects)
+        return issue
+
+    def restrict_references(self, allowed_projects: Collection[str]) -> None:
+        """Drop references to issues outside ``allowed_projects``.
+
+        An issue inside the project allowlist can point at issues outside it
+        through its parent, subtasks, issue links and epic link. Those
+        references carry the other issue's key and summary, so they are
+        removed rather than returned. A reference whose project cannot be
+        determined is removed as well.
+
+        Args:
+            allowed_projects: Upper-cased project keys (JIRA_PROJECTS_FILTER).
+        """
+        allowed = {str(k).strip().upper() for k in allowed_projects}
+
+        def ok(ref: Any) -> bool:
+            return _reference_project(ref) in allowed
+
+        if self.parent is not None and not ok(self.parent):
+            self.parent = None
+        self.subtasks = [st for st in self.subtasks if ok(st)]
+        self.issuelinks = [
+            link
+            for link in self.issuelinks
+            if all(
+                side is None or ok({"key": side.key})
+                for side in (link.inward_issue, link.outward_issue)
+            )
+            and (link.inward_issue is not None or link.outward_issue is not None)
+        ]
+        if self.epic_key and not ok({"key": self.epic_key}):
+            self.epic_key = None
 
     def to_simplified_dict(self) -> dict[str, Any]:
         """Convert to simplified dictionary for API response."""
@@ -508,9 +600,16 @@ class JiraIssue(ApiModel, TimestampMixin):
         if self.url and should_include_field("url"):
             result["url"] = self.url
 
+        if self.browse_url:
+            result["browse_url"] = self.browse_url
+
         # Add description if available and requested
         if self.description and should_include_field("description"):
             result["description"] = self.description
+
+        # Add environment if available and requested
+        if self.environment and should_include_field("environment"):
+            result["environment"] = self.environment
 
         # Add status if available and requested
         if self.status and should_include_field("status"):
@@ -574,6 +673,10 @@ class JiraIssue(ApiModel, TimestampMixin):
         if self.fix_versions and should_include_field("fixVersions"):
             result["fix_versions"] = self.fix_versions
 
+        # Affects Version/s
+        if self.versions and should_include_field("versions"):
+            result["versions"] = self.versions
+
         # Add epic fields if available and requested
         if self.epic_key and should_include_field("epic_key"):
             result["epic_key"] = self.epic_key
@@ -587,10 +690,10 @@ class JiraIssue(ApiModel, TimestampMixin):
 
         # Add created and updated timestamps if available and requested
         if self.created and should_include_field("created"):
-            result["created"] = self.created
+            result["created"] = self.format_timestamp(self.created)
 
         if self.updated and should_include_field("updated"):
-            result["updated"] = self.updated
+            result["updated"] = self.format_timestamp(self.updated)
 
         # Add comments if available and requested
         if self.comments and should_include_field("comment"):
@@ -760,6 +863,141 @@ class JiraIssue(ApiModel, TimestampMixin):
                     return field_id, field_value
 
         return None, None
+
+    def get_custom_field_by_name(
+        self, display_name: str, *, case_sensitive: bool = False
+    ) -> Any:
+        """Look up a custom field value by its human-readable display name.
+
+        This is a convenience wrapper over the internal ``custom_fields`` dict
+        (which is keyed by ``customfield_XXXXX``).  It searches the ``name``
+        entry stored inside each value object, so the underlying data structure
+        is completely untouched.
+
+        Args:
+            display_name: The human-readable name of the field
+                (e.g. ``"Story Points"``, ``"Severity"``).
+            case_sensitive: If *False* (default) the comparison is
+                case-insensitive.
+
+        Returns:
+            The processed field value if found, or *None*.
+        """
+        target = display_name if case_sensitive else display_name.lower()
+        for field_data in self.custom_fields.values():
+            if not isinstance(field_data, dict):
+                continue
+            stored_name = field_data.get("name")
+            if stored_name is None:
+                continue
+            candidate = stored_name if case_sensitive else stored_name.lower()
+            if candidate == target:
+                return self._process_custom_field_value(field_data.get("value"))
+        return None
+
+    @staticmethod
+    def _get_display_key(
+        field_id: str,
+        field_data: Any,
+        *,
+        reserved_keys: set[str],
+        used_keys: set[str],
+    ) -> str:
+        """Choose a display key without overwriting another field."""
+        if not isinstance(field_data, dict):
+            return field_id
+
+        display_name = field_data.get("name")
+        if (
+            not isinstance(display_name, str)
+            or not display_name
+            or display_name in reserved_keys
+            or display_name in used_keys
+        ):
+            return field_id
+        return display_name
+
+    @property
+    def custom_fields_by_display_name(self) -> dict[str, Any]:
+        """Return ``custom_fields`` re-keyed by display name.
+
+        Fields that do not carry a ``name`` entry keep their original
+        ``customfield_XXXXX`` key so nothing is silently dropped.
+
+        Each value retains the upstream structure
+        (``{"value": …}``) with an additional ``"field_id"`` key
+        for reverse-lookup convenience.  The redundant ``"name"`` entry is
+        stripped since the display name is already used as the dict key.
+
+        Returns:
+            A **new** dict — the original ``custom_fields`` is never mutated.
+        """
+        result: dict[str, Any] = {}
+        reserved_keys = set(self.custom_fields)
+        for field_id, field_data in self.custom_fields.items():
+            if not isinstance(field_data, dict):
+                result[field_id] = field_data
+                continue
+            display_key = self._get_display_key(
+                field_id,
+                field_data,
+                reserved_keys=reserved_keys,
+                used_keys=set(result),
+            )
+            entry = {**field_data, "field_id": field_id}
+            entry.pop("name", None)
+            result[display_key] = entry
+        return result
+
+    def to_display_name_dict(
+        self, extra_reserved_keys: set[str] | None = None
+    ) -> dict[str, Any]:
+        """Like ``to_simplified_dict`` but with custom fields keyed by display name.
+
+        Standard fields (summary, status, etc.) are identical to
+        ``to_simplified_dict()``.  Only the custom-field section changes:
+        each ``customfield_XXXXX`` key is replaced by its human-readable
+        name when one is available.
+
+        Args:
+            extra_reserved_keys: Additional keys that must not be claimed by
+                custom fields (e.g. enrichment section output keys like
+                ``"comments"``, ``"watchers"``).
+
+        Returns:
+            A simplified dict suitable for tool / API output where custom
+            fields use human-friendly keys.
+        """
+        base = self.to_simplified_dict()
+
+        custom_items = [
+            (key, value)
+            for key, value in base.items()
+            if key.startswith("customfield_")
+        ]
+        custom_field_ids = {key for key, _ in custom_items}
+        reserved_keys = set(base).difference(custom_field_ids) | custom_field_ids
+        if extra_reserved_keys:
+            reserved_keys |= extra_reserved_keys
+        rekeyed_customs: dict[str, Any] = {}
+
+        for key, value in custom_items:
+            display_key = self._get_display_key(
+                key,
+                value,
+                reserved_keys=reserved_keys,
+                used_keys=set(rekeyed_customs),
+            )
+            if isinstance(value, dict):
+                value = {**value, "field_id": key}
+                value.pop("name", None)
+            rekeyed_customs[display_key] = value
+
+        for key in custom_field_ids:
+            del base[key]
+
+        base.update(rekeyed_customs)
+        return base
 
     def _get_epic_name(self) -> str | None:
         """Get the epic name from custom fields if available."""

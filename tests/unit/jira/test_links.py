@@ -75,6 +75,75 @@ class TestLinksMixin:
         assert "Link created between PROJ-123 and PROJ-456" in response["message"]
         links_mixin.jira.create_issue_link.assert_called_once_with(data)
 
+    # --- JIRA_INTERNAL_ONLY_PROJECTS guard on link comments ---
+
+    @pytest.mark.parametrize("issue_key", ["CC-123", "CC%2D123", "%43C-123"])
+    def test_create_issue_link_comment_internal_only_inward_rejected(
+        self, links_mixin, issue_key
+    ):
+        """A link comment is rejected when the INWARD issue is in a listed
+        project, before any API call."""
+        links_mixin.config.internal_only_projects = frozenset({"CC"})
+        data = {
+            "type": {"name": "Blocks"},
+            "inwardIssue": {"key": issue_key},
+            "outwardIssue": {"key": "PROJ-456"},
+            "comment": {"body": "Client update"},
+        }
+
+        with pytest.raises(ValueError, match="internal-only"):
+            links_mixin.create_issue_link(data)
+        links_mixin.jira.create_issue_link.assert_not_called()
+
+    def test_create_issue_link_comment_internal_only_outward_rejected(
+        self, links_mixin
+    ):
+        """A link comment is rejected when the OUTWARD issue is in a listed
+        project — the guard errs safe by checking both sides rather than
+        resolving which issue Jira attaches the comment to."""
+        links_mixin.config.internal_only_projects = frozenset({"CC"})
+        data = {
+            "type": {"name": "Blocks"},
+            "inwardIssue": {"key": "PROJ-123"},
+            "outwardIssue": {"key": "CC-456"},
+            "comment": {"body": "Client update"},
+        }
+
+        with pytest.raises(ValueError, match="internal-only"):
+            links_mixin.create_issue_link(data)
+        links_mixin.jira.create_issue_link.assert_not_called()
+
+    def test_create_issue_link_without_comment_internal_only_passes(self, links_mixin):
+        """Linking listed-project issues WITHOUT a comment is allowed — the
+        guard only blocks the comment, not the link itself."""
+        links_mixin.config.internal_only_projects = frozenset({"CC"})
+        data = {
+            "type": {"name": "Blocks"},
+            "inwardIssue": {"key": "CC-123"},
+            "outwardIssue": {"key": "CC-456"},
+        }
+
+        response = links_mixin.create_issue_link(data)
+
+        assert response["success"] is True
+        links_mixin.jira.create_issue_link.assert_called_once_with(data)
+
+    def test_create_issue_link_comment_unlisted_projects_unaffected(self, links_mixin):
+        """A link comment between two unlisted projects passes through even
+        with the guard configured for another project."""
+        links_mixin.config.internal_only_projects = frozenset({"CC"})
+        data = {
+            "type": {"name": "Blocks"},
+            "inwardIssue": {"key": "PROJ-123"},
+            "outwardIssue": {"key": "PROJ-456"},
+            "comment": {"body": "Linked related issue"},
+        }
+
+        response = links_mixin.create_issue_link(data)
+
+        assert response["success"] is True
+        links_mixin.jira.create_issue_link.assert_called_once_with(data)
+
     def test_create_issue_link_missing_type(self, links_mixin):
         data = {
             "inwardIssue": {"key": "PROJ-123"},
@@ -195,6 +264,16 @@ class TestLinksMixin:
     def test_remove_issue_link_empty_id(self, links_mixin):
         with pytest.raises(ValueError, match="Link ID is required"):
             links_mixin.remove_issue_link("")
+
+    @pytest.mark.security_regression
+    @pytest.mark.parametrize(
+        "link_id", ["../issue/PROJ-1", "10000/../../issue/PROJ-1", "1%2F..", "１２３"]
+    )
+    def test_remove_issue_link_rejects_non_numeric_id(self, links_mixin, link_id):
+        """A crafted link_id must not retarget the DELETE (e.g. to an issue)."""
+        with pytest.raises(ValueError, match="ASCII digits"):
+            links_mixin.remove_issue_link(link_id)
+        links_mixin.jira.remove_issue_link.assert_not_called()
 
     def test_remove_issue_link_authentication_error(self, links_mixin):
         link_id = "10000"

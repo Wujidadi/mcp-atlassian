@@ -14,6 +14,7 @@ from fastmcp import Client
 from fastmcp.client import FastMCPTransport
 from mcp.types import CallToolResult, TextContent
 
+from mcp_atlassian.confluence import ConfluenceFetcher
 from mcp_atlassian.jira import JiraFetcher
 from mcp_atlassian.servers import main_mcp
 
@@ -27,6 +28,27 @@ async def call_tool(
 ) -> CallToolResult:
     """Helper to call tools via the MCP client."""
     return await client.call_tool(tool_name, arguments)
+
+
+def _comment_visibility_role(jira_fetcher: JiraFetcher, project_key: str) -> str:
+    """Return a project role the current user belongs to.
+
+    Role names differ between Cloud sites (for example ``Administrators`` on
+    a new Free site and ``Administrator`` on older ones), so the role used for
+    comment visibility is discovered instead of hardcoded.
+    """
+    roles = jira_fetcher.jira.get(
+        f"rest/api/3/project/{project_key}/roledetails",
+        params={"currentMember": "true", "excludeConnectAddons": "true"},
+    )
+    names = [
+        role["name"]
+        for role in roles or []
+        if isinstance(role, dict) and role.get("name")
+    ]
+    if not names:
+        pytest.skip(f"Current user has no project role in {project_key}")
+    return "Administrators" if "Administrators" in names else names[0]
 
 
 @pytest.fixture
@@ -58,6 +80,22 @@ class TestMCPJiraTools:
     """MCP Jira tool tests against Cloud."""
 
     @pytest.mark.anyio
+    async def test_jira_get_current_user_profile(
+        self,
+        mcp_client: Client,
+    ) -> None:
+        result = await call_tool(
+            mcp_client,
+            "jira_get_user_profile",
+            {"user_identifier": "me"},
+        )
+        assert not result.is_error
+        assert result.content and isinstance(result.content[0], TextContent)
+        data = json.loads(result.content[0].text)
+        assert data["success"] is True
+        assert data["user"]["account_id"] or data["user"]["display_name"]
+
+    @pytest.mark.anyio
     async def test_jira_get_issue(
         self,
         mcp_client: Client,
@@ -72,6 +110,33 @@ class TestMCPJiraTools:
         assert result.content and isinstance(result.content[0], TextContent)
         data = json.loads(result.content[0].text)
         assert data["key"] == cloud_instance.test_issue_key
+
+    @pytest.mark.anyio
+    async def test_jira_get_issue_use_display_names(
+        self,
+        mcp_client: Client,
+        cloud_instance: CloudInstanceInfo,
+    ) -> None:
+        result = await call_tool(
+            mcp_client,
+            "jira_get_issue",
+            {
+                "issue_key": cloud_instance.test_issue_key,
+                "fields": "*all",
+                "use_display_names": True,
+            },
+        )
+        assert not result.is_error
+        assert result.content and isinstance(result.content[0], TextContent)
+        data = json.loads(result.content[0].text)
+        assert data["key"] == cloud_instance.test_issue_key
+        custom_fields = {
+            key: value
+            for key, value in data.items()
+            if isinstance(value, dict) and "field_id" in value
+        }
+        assert custom_fields
+        assert any(key != value["field_id"] for key, value in custom_fields.items())
 
     @pytest.mark.anyio
     async def test_jira_search(
@@ -92,6 +157,36 @@ class TestMCPJiraTools:
         data = json.loads(result.content[0].text)
         assert "issues" in data
         assert len(data["issues"]) > 0
+
+    @pytest.mark.anyio
+    async def test_jira_search_use_display_names(
+        self,
+        mcp_client: Client,
+        cloud_instance: CloudInstanceInfo,
+    ) -> None:
+        result = await call_tool(
+            mcp_client,
+            "jira_search",
+            {
+                "jql": f"project={cloud_instance.project_key}",
+                "fields": "*all",
+                "limit": 1,
+                "use_display_names": True,
+            },
+        )
+        assert not result.is_error
+        assert result.content and isinstance(result.content[0], TextContent)
+        data = json.loads(result.content[0].text)
+        assert len(data["issues"]) == 1
+        issue = data["issues"][0]
+        assert issue["key"].startswith(f"{cloud_instance.project_key}-")
+        custom_fields = {
+            key: value
+            for key, value in issue.items()
+            if isinstance(value, dict) and "field_id" in value
+        }
+        assert custom_fields
+        assert any(key != value["field_id"] for key, value in custom_fields.items())
 
     @pytest.mark.anyio
     async def test_jira_create_and_delete_issue(
@@ -122,6 +217,93 @@ class TestMCPJiraTools:
             "jira_delete_issue",
             {"issue_key": issue_key},
         )
+
+    @pytest.mark.anyio
+    async def test_jira_update_orchestration_round_trip(
+        self,
+        mcp_client: Client,
+        cloud_instance: CloudInstanceInfo,
+        jira_fetcher: JiraFetcher,
+    ) -> None:
+        """Update fields, transition, comment, and worklog in one call."""
+        uid = uuid.uuid4().hex[:8]
+        visibility_role = _comment_visibility_role(
+            jira_fetcher, cloud_instance.project_key
+        )
+        create_result = await call_tool(
+            mcp_client,
+            "jira_create_issue",
+            {
+                "project_key": cloud_instance.project_key,
+                "summary": f"Cloud MCP Orchestration Test {uid}",
+                "description": "Created for update orchestration testing.",
+                "issue_type": "Task",
+            },
+        )
+        assert not create_result.is_error
+        assert create_result.content and isinstance(
+            create_result.content[0], TextContent
+        )
+        issue_key = json.loads(create_result.content[0].text)["issue"]["key"]
+
+        try:
+            transitions_result = await call_tool(
+                mcp_client,
+                "jira_get_transitions",
+                {"issue_key": issue_key},
+            )
+            assert not transitions_result.is_error
+            transitions = json.loads(transitions_result.content[0].text)
+            assert transitions
+            target = transitions[1] if len(transitions) > 1 else transitions[0]
+
+            update_result = await call_tool(
+                mcp_client,
+                "jira_update_issue",
+                {
+                    "issue_key": issue_key,
+                    "fields": json.dumps({"summary": f"Updated {uid}"}),
+                    "transition": target["name"],
+                    "comment": f"Cloud orchestration comment {uid}",
+                    "comment_visibility": json.dumps(
+                        {"type": "role", "value": visibility_role}
+                    ),
+                    "worklog": "1m",
+                },
+            )
+            assert not update_result.is_error
+            update_data = json.loads(update_result.content[0].text)
+            assert update_data["operations_failed"] == []
+            assert "fields_updated" in update_data["operations_performed"]
+            assert any(
+                operation.startswith("transitioned_to:")
+                for operation in update_data["operations_performed"]
+            )
+            assert "worklog_added" in update_data["operations_performed"]
+
+            round_trip_result = await call_tool(
+                mcp_client,
+                "jira_get_issue",
+                {
+                    "issue_key": issue_key,
+                    "fields": "summary,status",
+                    "include": "comments,worklogs",
+                },
+            )
+            assert not round_trip_result.is_error
+            round_trip = json.loads(round_trip_result.content[0].text)
+            assert round_trip["key"] == issue_key
+            assert any(
+                comment["body"] == f"Cloud orchestration comment {uid}"
+                for comment in round_trip["comments"]
+            )
+            assert round_trip["worklogs"]
+        finally:
+            await call_tool(
+                mcp_client,
+                "jira_delete_issue",
+                {"issue_key": issue_key},
+            )
 
     @pytest.mark.anyio
     async def test_jira_assign_issue(
@@ -183,6 +365,34 @@ class TestMCPConfluenceTools:
         )
         assert not result.is_error
         assert result.content and isinstance(result.content[0], TextContent)
+
+    @pytest.mark.anyio
+    async def test_confluence_get_page_with_tiny_link(
+        self,
+        mcp_client: Client,
+        cloud_instance: CloudInstanceInfo,
+        confluence_fetcher: ConfluenceFetcher,
+    ) -> None:
+        raw_page = confluence_fetcher.confluence.get_page_by_id(
+            cloud_instance.test_page_id
+        )
+        assert isinstance(raw_page, dict)
+        links = raw_page["_links"]
+        tiny_url = (
+            f"{links.get('base', cloud_instance.confluence_url).rstrip('/')}"
+            f"/{links['tinyui'].lstrip('/')}"
+        )
+
+        result = await call_tool(
+            mcp_client,
+            "confluence_get_page",
+            {"page_id": tiny_url},
+        )
+
+        assert not result.is_error
+        assert result.content and isinstance(result.content[0], TextContent)
+        data = json.loads(result.content[0].text)
+        assert str(data["metadata"]["id"]) == cloud_instance.test_page_id
 
     @pytest.mark.anyio
     async def test_confluence_search(
@@ -277,12 +487,12 @@ class TestMCPConfluenceTools:
         self,
         mcp_client: Client,
         cloud_instance: CloudInstanceInfo,
-        tmp_path: Path,
+        workspace_tmp_path: Path,
     ) -> None:
         uid = uuid.uuid4().hex[:8]
         page_id = None
-        create_file = tmp_path / "cloud-create.md"
-        update_file = tmp_path / "cloud-update.md"
+        create_file = workspace_tmp_path / "cloud-create.md"
+        update_file = workspace_tmp_path / "cloud-update.md"
         create_file.write_text("# Created from file\n\nCloud body.", encoding="utf-8")
         update_file.write_text("# Updated from file\n\nCloud body.", encoding="utf-8")
 

@@ -83,6 +83,7 @@ class ConfluencePage(ApiModel, TimestampMixin):
     id: str = CONFLUENCE_DEFAULT_ID
     title: str = EMPTY_STRING
     type: str = "page"  # "page", "blogpost", etc.
+    subtype: str | None = None
     status: str = "current"
     space: ConfluenceSpace | None = None
     content: str = EMPTY_STRING
@@ -204,14 +205,14 @@ class ConfluencePage(ApiModel, TimestampMixin):
             created = history.get("createdDate", EMPTY_STRING)
             updated = history.get("lastUpdated", {}).get("when", EMPTY_STRING)
 
-            # Fall back to version date if no history is available
-            if not updated and version and version.when:
-                updated = version.when
-
             # Fall back to history.createdBy if no top-level author
             if not author:
                 if created_by := history.get("createdBy"):
                     author = ConfluenceUser.from_api_response(created_by)
+
+        # Fall back to the version date when history has no update timestamp
+        if not updated and version and version.when:
+            updated = version.when
 
         # Construct URL if base_url is provided
         url = None
@@ -242,6 +243,7 @@ class ConfluencePage(ApiModel, TimestampMixin):
             id=str(data.get("id", CONFLUENCE_DEFAULT_ID)),
             title=data.get("title", EMPTY_STRING),
             type=data.get("type", "page"),
+            subtype=data.get("subtype"),
             status=data.get("status", "current"),
             space=space,
             content=content,
@@ -268,6 +270,9 @@ class ConfluencePage(ApiModel, TimestampMixin):
             "updated": self.format_timestamp(self.updated),
             "url": self.url,
         }
+
+        if self.subtype:
+            result["subtype"] = self.subtype
 
         # Add space information if available
         if self.space:

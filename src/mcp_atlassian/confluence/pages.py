@@ -6,16 +6,69 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import requests
+from atlassian.errors import ApiError
 from bs4 import BeautifulSoup, Tag
 from requests.exceptions import HTTPError
 
 from ..models.confluence import ConfluencePage
 from ..utils.decorators import handle_auth_errors
+from ..utils.pagination import clamp_limit
 from .client import ConfluenceClient
 from .utils import emoji_to_hex_id, extract_emoji_from_property
 from .v2_adapter import ConfluenceV2Adapter
 
 logger = logging.getLogger("mcp-atlassian")
+
+_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+_STRUCTURAL_MACRO_NAMES = frozenset({"excerpt", "expand", "layout"})
+_STRUCTURAL_WRAPPER_TAGS = frozenset(
+    {
+        "ac:layout",
+        "layout",
+        "ac:layout-section",
+        "layout-section",
+        "ac:layout-cell",
+        "layout-cell",
+    }
+)
+
+
+def _structured_macro_name(node: Tag) -> str:
+    raw = node.get("ac:name") or node.get("name") or ""
+    return str(raw).strip().lower()
+
+
+def _is_structural_wrapper(node: Tag) -> bool:
+    """Excerpt / expand / layout wrappers, not panels, tables, or random divs."""
+    if node.name in _STRUCTURAL_WRAPPER_TAGS:
+        return True
+    if node.name in {"ac:structured-macro", "structured-macro"}:
+        return _structured_macro_name(node) in _STRUCTURAL_MACRO_NAMES
+    return False
+
+
+def _is_section_boundary(
+    node: object,
+    section_level: int,
+    heading_tags: tuple[str, ...] | list[str] = _HEADING_TAGS,
+) -> bool:
+    """True if ``node`` ends a section of ``section_level``.
+
+    A sibling heading of the same or higher rank is a boundary. So is an
+    excerpt, expand, or layout wrapper that *contains* such a heading —
+    otherwise ``update_page_section`` treats the whole macro as body and
+    deletes it. Other wrappers (info panels, tables) are not boundaries.
+    """
+    if not isinstance(node, Tag):
+        return False
+    if node.name in heading_tags and int(node.name[1]) <= section_level:
+        return True
+    if not _is_structural_wrapper(node):
+        return False
+    for descendant in node.find_all(heading_tags):
+        if int(descendant.name[1]) <= section_level:
+            return True
+    return False
 
 
 class PagesMixin(ConfluenceClient):
@@ -33,6 +86,20 @@ class PagesMixin(ConfluenceClient):
                 session=self.confluence._session, base_url=self.confluence.url
             )
         return None
+
+    def _cloud_v2_adapter(self) -> ConfluenceV2Adapter | None:
+        """Get a v2 API adapter for any Confluence Cloud auth mode."""
+        if not self.config.is_cloud:
+            return None
+
+        if self.config.auth_type == "oauth":
+            base_url = self.confluence.url
+        else:
+            base_url = self.config.url
+        return ConfluenceV2Adapter(
+            session=self.confluence._session,
+            base_url=base_url,
+        )
 
     @property
     def _page_children_v2_adapter(self) -> ConfluenceV2Adapter | None:
@@ -172,7 +239,7 @@ class PagesMixin(ConfluenceClient):
         Args:
             page_id: The ID of the page to retrieve
             convert_to_markdown: When True, returns content in
-                markdown format, otherwise returns raw HTML
+                markdown format, otherwise returns raw Confluence storage XHTML
                 (keyword-only)
 
         Returns:
@@ -222,15 +289,16 @@ class PagesMixin(ConfluenceClient):
             page_attachments = (
                 page.get("children", {}).get("attachment", {}).get("results", [])
             )
-            processed_html, processed_markdown = self.preprocessor.process_html_content(
-                content,
-                space_key=space_key,
-                confluence_client=self.confluence,
-                content_id=page_id_str,
-                attachments=page_attachments,
-            )
-
-            page_content = processed_markdown if convert_to_markdown else processed_html
+            if convert_to_markdown:
+                _, page_content = self.preprocessor.process_html_content(
+                    content,
+                    space_key=space_key,
+                    confluence_client=self.confluence,
+                    content_id=page_id_str,
+                    attachments=page_attachments,
+                )
+            else:
+                page_content = content
 
             # Fetch page emoji and width from content properties
             emoji = self._get_page_emoji(page_id)
@@ -314,7 +382,11 @@ class PagesMixin(ConfluenceClient):
             if not properties:
                 return None
 
-            results = properties.get("results", [])
+            results = (
+                properties
+                if isinstance(properties, list)
+                else properties.get("results", [])
+            )
             for prop in results:
                 key = prop.get("key", "")
                 if key in ("emoji-title-published", "emoji-title-draft"):
@@ -345,12 +417,37 @@ class PagesMixin(ConfluenceClient):
         """
         try:
             if value is None:
-                # Delete the property
+                # Delete the property. A property that is already absent leaves the
+                # page in the requested state, so only a 404 counts as success --
+                # anything else (denied, locked, throttled, transport failure) means
+                # the removal did not happen and must not be reported as done.
                 try:
                     self.confluence.delete_page_property(page_id, property_key)
-                except Exception as e:
-                    # Property might not exist, which is fine
-                    logger.debug(f"Could not delete property '{property_key}': {e}")
+                except (HTTPError, ApiError) as api_err:
+                    http_err = (
+                        api_err if isinstance(api_err, HTTPError) else api_err.reason
+                    )
+                    if (
+                        isinstance(http_err, HTTPError)
+                        and http_err.response is not None
+                        and http_err.response.status_code == 404
+                    ):
+                        logger.debug(
+                            f"Property '{property_key}' already absent on page "
+                            f"{page_id}"
+                        )
+                        return True
+                    logger.warning(
+                        f"Could not delete property '{property_key}' for page "
+                        f"{page_id}: {http_err}"
+                    )
+                    return False
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"Could not delete property '{property_key}' for page "
+                        f"{page_id}: {e}"
+                    )
+                    return False
                 return True
 
             # Check if the property already exists (need version for update)
@@ -447,7 +544,11 @@ class PagesMixin(ConfluenceClient):
             if not properties:
                 return None
 
-            results = properties.get("results", [])
+            results = (
+                properties
+                if isinstance(properties, list)
+                else properties.get("results", [])
+            )
             for prop in results:
                 key = prop.get("key", "")
                 if key in ("content-appearance-published", "content-appearance-draft"):
@@ -519,7 +620,7 @@ class PagesMixin(ConfluenceClient):
             space_key: The key of the space containing the page
             title: The title of the page to retrieve
             convert_to_markdown: When True, returns content in markdown format,
-                               otherwise returns raw HTML (keyword-only)
+                otherwise returns raw Confluence storage XHTML (keyword-only)
 
         Returns:
             ConfluencePage model containing the page content and metadata, or None if not found
@@ -527,8 +628,10 @@ class PagesMixin(ConfluenceClient):
         try:
             # Directly try to find the page by title
             page = self.confluence.get_page_by_title(
-                space=space_key, title=title, expand="body.storage,version"
+                space_key, title, expand="body.storage,version"
             )
+            if isinstance(page, dict) and isinstance(page.get("results"), list):
+                page = page["results"][0] if page["results"] else None
 
             if not page:
                 logger.warning(
@@ -544,15 +647,15 @@ class PagesMixin(ConfluenceClient):
                     f"Page {page.get('id', 'unknown')} missing body.storage.value: {e}"
                 )
                 content = ""
-            processed_html, processed_markdown = self.preprocessor.process_html_content(
-                content,
-                space_key=space_key,
-                confluence_client=self.confluence,
-                content_id=str(page.get("id", "")),
-            )
-
-            # Use the appropriate content format based on the convert_to_markdown flag
-            page_content = processed_markdown if convert_to_markdown else processed_html
+            if convert_to_markdown:
+                _, page_content = self.preprocessor.process_html_content(
+                    content,
+                    space_key=space_key,
+                    confluence_client=self.confluence,
+                    content_id=str(page.get("id", "")),
+                )
+            else:
+                page_content = content
 
             # Fetch page emoji and width from content properties
             emoji = self._get_page_emoji(str(page.get("id", "")))
@@ -608,7 +711,7 @@ class PagesMixin(ConfluenceClient):
             List of ConfluencePage models containing page content and metadata
         """
         pages = self.confluence.get_all_pages_from_space(
-            space=space_key, start=start, limit=limit, expand="body.storage"
+            space_key, start=start, limit=limit, expand="body.storage"
         )
 
         page_models = []
@@ -664,6 +767,8 @@ class PagesMixin(ConfluenceClient):
         content_representation: str | None = None,
         emoji: str | None = None,
         page_width: str | None = None,
+        subtype: str | None = None,
+        table_layout: str | None = None,
     ) -> ConfluencePage:
         """
         Create a new page in a Confluence space.
@@ -678,6 +783,8 @@ class PagesMixin(ConfluenceClient):
             content_representation: Content format when is_markdown=False ('wiki' or 'storage', keyword-only)
             emoji: Optional emoji character for the page title icon (keyword-only)
             page_width: Optional page layout width ('full-width', 'max', or 'default', keyword-only)
+            subtype: Optional Confluence page subtype. Use "live" to create a Live Doc.
+            table_layout: Optional table width preset for markdown tables ('full-width', 'wide', 'default', keyword-only)
 
         Returns:
             ConfluencePage model containing the new page's data
@@ -690,7 +797,9 @@ class PagesMixin(ConfluenceClient):
             if is_markdown:
                 # Convert markdown to Confluence storage format
                 final_body = self.preprocessor.markdown_to_confluence_storage(
-                    body, enable_heading_anchors=enable_heading_anchors
+                    body,
+                    enable_heading_anchors=enable_heading_anchors,
+                    table_layout=table_layout,
                 )
                 representation = "storage"
             else:
@@ -698,19 +807,29 @@ class PagesMixin(ConfluenceClient):
                 final_body = body
                 representation = content_representation or "storage"
 
-            # Use v2 API for OAuth authentication, v1 API for token/basic auth
+            # Use v2 API for OAuth authentication and for Cloud page subtypes
+            # such as Live Docs. The v1 API/client does not expose subtype.
             v2_adapter = self._v2_adapter
+            if subtype:
+                v2_adapter = self._cloud_v2_adapter()
+                if not v2_adapter:
+                    raise ValueError(
+                        "Confluence page subtype is only supported for Confluence Cloud"
+                    )
             if v2_adapter:
                 logger.debug(
                     f"Using v2 API for OAuth authentication to create page '{title}'"
                 )
-                result = v2_adapter.create_page(
-                    space_key=space_key,
-                    title=title,
-                    body=final_body,
-                    parent_id=parent_id,
-                    representation=representation,
-                )
+                create_kwargs = {
+                    "space_key": space_key,
+                    "title": title,
+                    "body": final_body,
+                    "parent_id": parent_id,
+                    "representation": representation,
+                }
+                if subtype:
+                    create_kwargs["subtype"] = subtype
+                result = v2_adapter.create_page(**create_kwargs)
             else:
                 logger.debug(
                     f"Using v1 API for token/basic authentication to create page '{title}'"
@@ -730,11 +849,23 @@ class PagesMixin(ConfluenceClient):
 
             # Set the page emoji if provided
             if emoji:
-                self._set_page_emoji(page_id, emoji)
+                emoji_updated = self._set_page_emoji(page_id, emoji)
+                if not emoji_updated:
+                    error_message = (
+                        f"Page was created, but page emoji update failed "
+                        f"for page {page_id}"
+                    )
+                    raise RuntimeError(error_message)
 
             # Set the page width if provided
             if page_width:
-                self._set_page_width(page_id, page_width)
+                width_updated = self._set_page_width(page_id, page_width)
+                if not width_updated:
+                    error_message = (
+                        f"Page was created, but page width update failed "
+                        f"for page {page_id}"
+                    )
+                    raise RuntimeError(error_message)
 
             return self.get_page_content(page_id)
         except Exception as e:
@@ -759,6 +890,7 @@ class PagesMixin(ConfluenceClient):
         content_representation: str | None = None,
         emoji: str | None = None,
         page_width: str | None = None,
+        table_layout: str | None = None,
     ) -> ConfluencePage:
         """
         Update an existing page in Confluence.
@@ -775,6 +907,7 @@ class PagesMixin(ConfluenceClient):
             content_representation: Content format when is_markdown=False ('wiki' or 'storage', keyword-only)
             emoji: Optional emoji character for the page title icon (keyword-only). Pass empty string to remove emoji.
             page_width: Optional page layout width ('full-width', 'max', or 'default', keyword-only). Pass empty string to reset to default.
+            table_layout: Optional table width preset for markdown tables ('full-width', 'wide', 'default', keyword-only)
 
         Returns:
             ConfluencePage model containing the updated page's data
@@ -787,7 +920,9 @@ class PagesMixin(ConfluenceClient):
             if is_markdown:
                 # Convert markdown to Confluence storage format
                 final_body = self.preprocessor.markdown_to_confluence_storage(
-                    body, enable_heading_anchors=enable_heading_anchors
+                    body,
+                    enable_heading_anchors=enable_heading_anchors,
+                    table_layout=table_layout,
                 )
                 representation = "storage"
             else:
@@ -833,13 +968,25 @@ class PagesMixin(ConfluenceClient):
             if emoji is not None:
                 # Empty string means remove emoji, otherwise set it
                 emoji_to_set = emoji if emoji else None
-                self._set_page_emoji(page_id, emoji_to_set)
+                emoji_updated = self._set_page_emoji(page_id, emoji_to_set)
+                if not emoji_updated:
+                    error_message = (
+                        f"Page content was updated, but page emoji update failed "
+                        f"for page {page_id}"
+                    )
+                    raise RuntimeError(error_message)
 
             # Set or remove the page width if provided
             if page_width is not None:
                 # Empty string means reset to default, otherwise set it
                 width_to_set = page_width if page_width else None
-                self._set_page_width(page_id, width_to_set)
+                width_updated = self._set_page_width(page_id, width_to_set)
+                if not width_updated:
+                    error_message = (
+                        f"Page content was updated, but page width update failed "
+                        f"for page {page_id}"
+                    )
+                    raise RuntimeError(error_message)
 
             # After update, refresh the page data
             return self.get_page_content(page_id)
@@ -862,8 +1009,11 @@ class PagesMixin(ConfluenceClient):
         Fetches the page in raw storage format, locates the section identified by
         its heading text, replaces only the content between that heading and the
         next heading of the same or higher level, and writes the modified storage
-        XML back. This is lossless: macros, layouts, mentions, and all other
-        Confluence-specific elements outside the target section are preserved.
+        XML back. A following excerpt, expand, or layout that *contains* such
+        a heading is a boundary too (that wrapper is not replaced). Other
+        wrappers are unchanged. This is lossless: macros, layouts, mentions,
+        and all other Confluence-specific elements outside the target section
+        are preserved.
 
         Args:
             page_id: The ID of the page to update.
@@ -930,14 +1080,15 @@ class PagesMixin(ConfluenceClient):
 
         # 4. Collect all sibling nodes that belong to this section (between
         #    this heading and the next heading of the same or higher level).
-        #    NavigableString nodes (whitespace, text) are included alongside
-        #    Tag nodes, so we type the list broadly.
+        #    Headings nested inside the next sibling (excerpt/layout/expand
+        #    macros) count as well — otherwise the whole macro is treated as
+        #    body and wiped. NavigableString nodes (whitespace, text) are
+        #    included alongside Tag nodes, so we type the list broadly.
         siblings_to_remove: list[Any] = []
         current = target_heading.next_sibling
         while current is not None:
-            if isinstance(current, Tag) and current.name in heading_tags:
-                if int(current.name[1]) <= heading_level:
-                    break
+            if _is_section_boundary(current, heading_level, heading_tags):
+                break
             siblings_to_remove.append(current)
             current = current.next_sibling
 
@@ -984,7 +1135,7 @@ class PagesMixin(ConfluenceClient):
         page_id: str,
         start: int = 0,
         limit: int = 25,
-        expand: str = "version",
+        expand: str = "version,history",
         *,
         convert_to_markdown: bool = True,
         include_folders: bool = True,
@@ -1005,6 +1156,8 @@ class PagesMixin(ConfluenceClient):
             List of ConfluencePage models containing the child pages and folders
         """
         try:
+            limit = clamp_limit(limit, context="confluence.get_page_children")
+
             v2_adapter = self._page_children_v2_adapter
             if v2_adapter:
                 logger.debug(f"Using v2 API to get children for Cloud page '{page_id}'")
@@ -1143,6 +1296,8 @@ class PagesMixin(ConfluenceClient):
             Exception: If there is an error fetching pages
         """
         try:
+            limit = clamp_limit(limit, context="confluence.get_space_page_tree")
+
             # Paginate using the raw API to access _links.next for reliable
             # truncation detection. The higher-level get_all_pages_from_space()
             # has a broken termination condition when limit > server-side cap.
@@ -1501,3 +1656,81 @@ class PagesMixin(ConfluenceClient):
             "to_version": to_version,
             "diff": diff_string,
         }
+
+    @handle_auth_errors("Confluence API")
+    def copy_page(
+        self,
+        source_page_id: str,
+        destination_space_key: str,
+        new_title: str,
+        destination_parent_id: str | None = None,
+        *,
+        copy_attachments: bool = True,
+    ) -> ConfluencePage:
+        """Copy a Confluence page to a new location.
+
+        On Confluence Cloud the native copy endpoint is used
+        (``POST /wiki/rest/api/content/{id}/copy``).  On Server/Data Center
+        the page body and title are fetched and a new page is created manually
+        (attachments are not copied in the Server/DC fallback path).
+
+        Args:
+            source_page_id: The ID of the page to copy.
+            destination_space_key: Space key for the new page.
+            new_title: Title of the new page.
+            destination_parent_id: Optional parent page ID in the destination space.
+                When omitted the new page is created at the space root.
+            copy_attachments: Whether to copy attachments (Cloud only, keyword-only).
+
+        Returns:
+            ConfluencePage model for the newly created copy.
+
+        Raises:
+            MCPAtlassianAuthenticationError: If authentication fails.
+            Exception: If the copy operation fails.
+        """
+        try:
+            if self.config.is_cloud:
+                payload: dict[str, object] = {
+                    "copyAttachments": copy_attachments,
+                    "copyPermissions": False,
+                    "copyProperties": False,
+                    "copyLabels": False,
+                    "pageTitle": new_title,
+                    "destination": {
+                        "type": "parent_page" if destination_parent_id else "space",
+                        "value": destination_parent_id or destination_space_key,
+                    },
+                }
+                result = self.confluence.post(
+                    f"{self._v1_rest_base_url()}/rest/api/content/"
+                    f"{source_page_id}/copy",
+                    data=payload,
+                    absolute=True,
+                )
+            else:
+                # Server/DC: manual GET + POST (no native copy endpoint)
+                source = self.confluence.get_page_by_id(
+                    source_page_id, expand="body.storage,version,space"
+                )
+                body = source.get("body", {}).get("storage", {}).get("value", "")
+                create_kwargs: dict[str, object] = {
+                    "space": destination_space_key,
+                    "title": new_title,
+                    "body": body,
+                    "representation": "storage",
+                }
+                if destination_parent_id:
+                    create_kwargs["parent_id"] = destination_parent_id
+                result = self.confluence.create_page(**create_kwargs)
+
+            new_page_id = result.get("id")
+            if not new_page_id:
+                raise ValueError("Copy response did not contain a page ID")
+
+            return self.get_page_content(new_page_id)
+        except HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error copying page {source_page_id}: {str(e)}")
+            raise Exception(f"Failed to copy page {source_page_id}: {str(e)}") from e
