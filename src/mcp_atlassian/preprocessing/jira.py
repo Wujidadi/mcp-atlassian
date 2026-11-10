@@ -662,6 +662,15 @@ class JiraPreprocessor(BasePreprocessor):
         # Rejoin the lines
         output = "\n".join(lines)
 
+        # Jira Server/DC auto-links a bare URL together with a closing
+        # emphasis marker glued to it (``*https://x*`` links to
+        # ``https://x*``), so bracket bare URLs directly inside emphasis.
+        output = re.sub(
+            r"(?<![\w\[|!])([*_])((?:https?|ftp)://[^\s<>\[\]|\x00]+)\1(?!\w)",
+            r"\1[\2]\1",
+            output,
+        )
+
         # Restore code blocks and inline code
         output = _restore_blocks(output, code_blocks, "CODEBLOCK")
         output = _restore_blocks(output, inline_codes, "INLINECODE")

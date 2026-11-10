@@ -1815,9 +1815,36 @@ def test_markdown_to_jira_preserves_underscores_in_bare_urls(
     )
     assert (
         preprocessor_with_jira.markdown_to_jira("**https://example.com/foo_bar**")
-        == "*https://example.com/foo_bar*"
+        == "*[https://example.com/foo_bar]*"
     )
     assert (
         preprocessor_with_jira.markdown_to_jira("_see https://example.com/foo_bar_")
         == "_see https://example.com/foo_bar_"
+    )
+
+
+def test_markdown_to_jira_brackets_bare_urls_inside_emphasis(preprocessor_with_jira):
+    """Jira Server/DC would link the closing emphasis marker as part of the URL."""
+    assert (
+        preprocessor_with_jira.markdown_to_jira("*https://example.com/a_b*")
+        == "_[https://example.com/a_b]_"
+    )
+    assert (
+        preprocessor_with_jira.markdown_to_jira("**https://example.com/a_b/** done")
+        == "*[https://example.com/a_b/]* done"
+    )
+    # A URL that is not the whole emphasized span stays bare.
+    assert (
+        preprocessor_with_jira.markdown_to_jira("_see https://example.com/foo_bar_")
+        == "_see https://example.com/foo_bar_"
+    )
+    # Link targets are already bracketed and are left alone.
+    assert (
+        preprocessor_with_jira.markdown_to_jira("**[MR](https://example.com/a_b)**")
+        == "*[MR|https://example.com/a_b]*"
+    )
+    # Emphasis-like characters inside inline code are untouched.
+    assert (
+        preprocessor_with_jira.markdown_to_jira("`*https://example.com/a_b*`")
+        == "{{*https://example.com/a_b*}}"
     )
