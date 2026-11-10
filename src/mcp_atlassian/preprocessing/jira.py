@@ -517,6 +517,19 @@ class JiraPreprocessor(BasePreprocessor):
             output,
         )
 
+        # Jira auto-links bare URLs, so their underscores must stay literal;
+        # trailing sentence punctuation is left outside the protected URL.
+        def protect_bare_url(match: re.Match[str]) -> str:
+            url = match.group(0)
+            core = url.rstrip(".,;:!?")
+            return store_markdown_url_target(core) + url[len(core) :]
+
+        output = re.sub(
+            r"(?<![\w\[|!])https?://[!#-'*-;=?-Z\\^-{}~]+",
+            protect_bare_url,
+            output,
+        )
+
         # Bold and italic - skip lines starting with
         # asterisks+space (Jira list syntax, issue #786)
         def escape_intraword_underscore_runs(match: re.Match[str]) -> str:
